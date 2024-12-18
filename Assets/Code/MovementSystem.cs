@@ -1,7 +1,9 @@
 using Cinemachine;
 using TMPro;
+using UnityEditor.Experimental;
 using UnityEngine;
 using UnityEngine.InputSystem;
+using UnityEngine.ProBuilder.MeshOperations;
 
 public class MovementSystem : MonoBehaviour
 {
@@ -45,6 +47,7 @@ public class MovementSystem : MonoBehaviour
     [SerializeField] private Rigidbody PlayerRigidbody;
     [SerializeField] private float CrouchSize = 3;
     [SerializeField] private float MovementSpeed = 4;
+    [SerializeField] private float SlideSpeed = 20;
     [SerializeField] private float CrouchSpeed = 2;
     [SerializeField] private float SprintSpeed = 2;
     [SerializeField] private float ClimbingSpeed = 7;
@@ -114,21 +117,24 @@ public class MovementSystem : MonoBehaviour
 
     private float currentSprintSpeed;
     private float currentCameraSprintFOV;
-    
+
     private Vector3 lastFallPosition;
+    private Vector3 slideDirection;
     private bool intenseFall;
-    
-    private Vector3 slopeNormal;
     private void MovePlayer() {
+        Vector3 moveDirection = Vector3.Normalize(transform.right * MoveDirection.x + transform.forward * MoveDirection.y);
+
         // Crouching   
-        if (IsCrouching())
+        if (IsCrouching()) {
             transform.localScale = new Vector3(1, 1 / CrouchSize, 1);
-        else if (!Physics.Raycast(transform.position, transform.up, 2.2f, ~(1 << gameObject.layer)))
-            transform.localScale = new Vector3(1, 1, 1);
+        }
+        else if (!Physics.Raycast(transform.position, transform.up, 2.2f, ~(1 << gameObject.layer))) {
+            transform.localScale = Vector3.one;
+        }
 
         // Running
         float cameraBobbingAmplitude = PlayerCamera.GetCinemachineComponent<CinemachineBasicMultiChannelPerlin>().m_AmplitudeGain;
-        if (!CanClimb() && CheckGround()) {
+        if (!CanClimb() && (CheckGround() || OnSlope())) {
             int crouch = !IsCrouching() ? 1 : 0;
             float speedToLerp = SprintValue * MoveDirection.sqrMagnitude * crouch;
             currentSprintSpeed = Mathf.Lerp(currentSprintSpeed, SprintSpeed * speedToLerp, Time.fixedDeltaTime * StartFriction);
@@ -169,42 +175,46 @@ public class MovementSystem : MonoBehaviour
         lastFallPosition = new(0, PlayerRigidbody.velocity.y, 0);
 
         // Moving
-        if (MoveDirection != Vector2.zero) {
-            Vector3 playerMovementVelocity = Vector3.Normalize(transform.right * MoveDirection.x + transform.forward * MoveDirection.y);
-
-            if (OnSlope()) {
-                playerMovementVelocity = Vector3.ProjectOnPlane(playerMovementVelocity, slopeNormal).normalized;
-                playerMovementVelocity.y = 0;
-            }
-
-            else if (CanClimb()) {
-                playerMovementVelocity += Vector3.Normalize(transform.up * MoveDirection.y);
+        if (MoveDirection != Vector2.zero) {           
+            if (CanClimb()) {
+                moveDirection += Vector3.Normalize(transform.up * MoveDirection.y);
                 PlayerRigidbody.velocity = new(
-                    PlayerRigidbody.velocity.x, 
-                    playerMovementVelocity.y * ClimbingSpeed - (CrouchValue * ClimbingSpeed / CrouchSize), 
+                    PlayerRigidbody.velocity.x,
+                    moveDirection.y * ClimbingSpeed - (CrouchValue * ClimbingSpeed / CrouchSize), 
                     PlayerRigidbody.velocity.z
                 );
             }
 
-            float moveSpeed = MovementSpeed + currentSprintSpeed - CrouchSpeed * CrouchValue;
-            Vector3 lerpVector = new(
-                playerMovementVelocity.x * moveSpeed, 
-                PlayerRigidbody.velocity.y, 
-                playerMovementVelocity.z * moveSpeed
-            );
-            
-            PlayerRigidbody.velocity = Vector3.Lerp(PlayerRigidbody.velocity, lerpVector, Time.fixedDeltaTime * StartFriction);
+            else {
+                Vector3 slopeMoveDirection = Vector3.ProjectOnPlane(moveDirection, GetSlopeNormal()).normalized;
+                float moveSpeed = MovementSpeed + currentSprintSpeed - CrouchSpeed * CrouchValue;
+                Vector3 lerpVector = new(
+                    slopeMoveDirection.x * moveSpeed,
+                    PlayerRigidbody.velocity.y,
+                    slopeMoveDirection.z * moveSpeed
+                );
+
+                PlayerRigidbody.velocity = Vector3.Lerp(PlayerRigidbody.velocity, lerpVector, Time.fixedDeltaTime * StartFriction);
+            }
+
+            if (!IsCrouching()) {
+                slideDirection = transform.forward;
+            }
         }
 
         else if (MoveDirection == Vector2.zero) {
             float lerpY = PlayerRigidbody.velocity.y;
-            if (OnSlope()) 
-                lerpY = 0;
-
-            PlayerRigidbody.velocity = Vector3.Lerp(PlayerRigidbody.velocity, new Vector3(0, lerpY), Time.fixedDeltaTime * EndFriction);
+            Vector3 lerpXZ = Vector3.zero;
+            
+            if (OnSlope() && IsCrouching())
+                lerpXZ = Vector3.Normalize(PlayerRigidbody.velocity + slideDirection) * SlideSpeed;
+            
+            PlayerRigidbody.velocity = Vector3.Lerp(
+                PlayerRigidbody.velocity,
+                new Vector3(lerpXZ.x, lerpY, lerpXZ.z),
+                Time.fixedDeltaTime * (EndFriction - (CrouchValue * EndFriction / 2))
+            );
         }
-     
-        PlayerRigidbody.useGravity = !OnSlope();
     }
 
     private bool IsCrouching() {
@@ -215,7 +225,7 @@ public class MovementSystem : MonoBehaviour
         float moveSpeed = MovementSpeed + currentSprintSpeed;
         Vector3 jumpDirection = MoveDirection.x * moveSpeed * transform.right + MoveDirection.y * moveSpeed * transform.forward;
         Vector3 jumpHeight = (JumpForce - CrouchValue * JumpForce / CrouchSize) * transform.up;
-        if (CheckGround())
+        if (CheckGround() || OnSlope())
             PlayerRigidbody.AddForce(
                 jumpDirection + jumpHeight,
                 ForceMode.Impulse
@@ -231,13 +241,18 @@ public class MovementSystem : MonoBehaviour
     }
 
     private bool OnSlope() {
-        if (Physics.Raycast(transform.position, Vector3.down, out RaycastHit slopeHit, 0.1f)) {
-            slopeNormal = slopeHit.normal;
-            float angle = Vector3.Angle(Vector3.up, slopeNormal);
+        if (Physics.Raycast(transform.position, Vector3.down, out RaycastHit slopeHit, 0.2f)) {
+            float angle = Vector3.Angle(Vector3.up, slopeHit.normal);
             return angle < MaxSlopeAngle && angle != 0;
         }
-
         return false;
+    }
+
+    private Vector3 GetSlopeNormal() {
+        if (Physics.Raycast(transform.position, Vector3.down, out RaycastHit slopeHit, 0.2f))
+            return slopeHit.normal;
+
+        return Vector3.zero;
     }
 
     private Collider[] TouchingColliders() {
